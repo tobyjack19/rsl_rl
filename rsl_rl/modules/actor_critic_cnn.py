@@ -11,7 +11,7 @@ from tensordict import TensorDict
 from torch.distributions import Normal
 from typing import Any
 
-from rsl_rl.networks import CNN, MLP, EmpiricalNormalization
+from rsl_rl.networks import CNN, CNN3D, MLP, EmpiricalNormalization
 
 from .actor_critic import ActorCritic
 from ipdb import set_trace
@@ -45,62 +45,79 @@ class ActorCriticCNN(ActorCritic):
         self.obs_groups = obs_groups
         num_actor_obs_1d = 0
         self.actor_obs_groups_1d = []
-        actor_in_dims_2d = []
-        actor_in_channels_2d = []
-        self.actor_obs_groups_2d = []
+        actor_in_dims_nd = []
+        actor_in_channels_nd = []
+        self.actor_obs_groups_nd = []
+        self.actor_obs_ndim = {}  # obs_group -> ndim (4 or 5)
         for obs_group in obs_groups["policy"]:
-            if len(obs[obs_group].shape) == 4:  # B, C, H, W
-                self.actor_obs_groups_2d.append(obs_group)
-                actor_in_dims_2d.append(obs[obs_group].shape[2:4]) # H, W
-                actor_in_channels_2d.append(obs[obs_group].shape[1]) # C
-            elif len(obs[obs_group].shape) == 2:  # B, C
+            ndim = len(obs[obs_group].shape)
+            if ndim == 5:  # B, C, D, H, W
+                self.actor_obs_groups_nd.append(obs_group)
+                actor_in_dims_nd.append(obs[obs_group].shape[2:5])  # D, H, W
+                actor_in_channels_nd.append(obs[obs_group].shape[1])  # C
+                self.actor_obs_ndim[obs_group] = 5
+            elif ndim == 4:  # B, C, H, W
+                self.actor_obs_groups_nd.append(obs_group)
+                actor_in_dims_nd.append(obs[obs_group].shape[2:4])  # H, W
+                actor_in_channels_nd.append(obs[obs_group].shape[1])  # C
+                self.actor_obs_ndim[obs_group] = 4
+            elif ndim == 2:  # B, C
                 self.actor_obs_groups_1d.append(obs_group)
                 num_actor_obs_1d += obs[obs_group].shape[-1]
             else:
                 raise ValueError(f"Invalid observation shape for {obs_group}: {obs[obs_group].shape}")
         num_critic_obs_1d = 0
         self.critic_obs_groups_1d = []
-        critic_in_dims_2d = []
-        critic_in_channels_2d = []
-        self.critic_obs_groups_2d = []
+        critic_in_dims_nd = []
+        critic_in_channels_nd = []
+        self.critic_obs_groups_nd = []
+        self.critic_obs_ndim = {}
         for obs_group in obs_groups["critic"]:
-            if len(obs[obs_group].shape) == 4:  # B, C, H, W
-                self.critic_obs_groups_2d.append(obs_group)
-                critic_in_dims_2d.append(obs[obs_group].shape[2:4])
-                critic_in_channels_2d.append(obs[obs_group].shape[1])
-            elif len(obs[obs_group].shape) == 2:  # B, C
+            ndim = len(obs[obs_group].shape)
+            if ndim == 5:  # B, C, D, H, W
+                self.critic_obs_groups_nd.append(obs_group)
+                critic_in_dims_nd.append(obs[obs_group].shape[2:5])
+                critic_in_channels_nd.append(obs[obs_group].shape[1])
+                self.critic_obs_ndim[obs_group] = 5
+            elif ndim == 4:  # B, C, H, W
+                self.critic_obs_groups_nd.append(obs_group)
+                critic_in_dims_nd.append(obs[obs_group].shape[2:4])
+                critic_in_channels_nd.append(obs[obs_group].shape[1])
+                self.critic_obs_ndim[obs_group] = 4
+            elif ndim == 2:  # B, C
                 self.critic_obs_groups_1d.append(obs_group)
                 num_critic_obs_1d += obs[obs_group].shape[-1]
             else:
                 raise ValueError(f"Invalid observation shape for {obs_group}: {obs[obs_group].shape}")
 
-        # Assert that there are 2D observations
-        assert self.actor_obs_groups_2d or self.critic_obs_groups_2d, (
-            "No 2D observations are provided. If this is intentional, use the ActorCritic module instead."
+        # Assert that there are image observations (2D or 3D)
+        assert self.actor_obs_groups_nd or self.critic_obs_groups_nd, (
+            "No image observations (4D or 5D) are provided. If this is intentional, use the ActorCritic module instead."
         )
 
         # Actor CNN
-        if self.actor_obs_groups_2d:
+        if self.actor_obs_groups_nd:
             # Resolve the actor CNN configuration
-            assert actor_cnn_cfg is not None, "An actor CNN configuration is required for 2D actor observations."
-            # If a single configuration dictionary is provided, create a dictionary for each 2D observation group
+            assert actor_cnn_cfg is not None, "An actor CNN configuration is required for image actor observations."
+            # If a single configuration dictionary is provided, create a dictionary for each image observation group
             if not all(isinstance(v, dict) for v in actor_cnn_cfg.values()):
-                actor_cnn_cfg = {group: actor_cnn_cfg for group in self.actor_obs_groups_2d}
+                actor_cnn_cfg = {group: actor_cnn_cfg for group in self.actor_obs_groups_nd}
             # Check that the number of configs matches the number of observation groups
-            assert len(actor_cnn_cfg) == len(self.actor_obs_groups_2d), (
-                "The number of CNN configurations must match the number of 2D actor observations."
+            assert len(actor_cnn_cfg) == len(self.actor_obs_groups_nd), (
+                "The number of CNN configurations must match the number of image actor observations."
             )
 
-            # Create CNNs for each 2D actor observation
+            # Create CNNs for each image actor observation
             self.actor_cnns = nn.ModuleDict()
             encoding_dim = 0
-            for idx, obs_group in enumerate(self.actor_obs_groups_2d):
-                self.actor_cnns[obs_group] = CNN(
-                    input_dim=actor_in_dims_2d[idx],
-                    input_channels=actor_in_channels_2d[idx],
+            for idx, obs_group in enumerate(self.actor_obs_groups_nd):
+                cnn_class = CNN3D if self.actor_obs_ndim[obs_group] == 5 else CNN
+                self.actor_cnns[obs_group] = cnn_class(
+                    input_dim=actor_in_dims_nd[idx],
+                    input_channels=actor_in_channels_nd[idx],
                     **actor_cnn_cfg[obs_group],
                 )
-                print(f"Actor CNN for {obs_group}: {self.actor_cnns[obs_group]}")
+                print(f"Actor {'CNN3D' if self.actor_obs_ndim[obs_group] == 5 else 'CNN'} for {obs_group}: {self.actor_cnns[obs_group]}")
                 # Get the output dimension of the CNN
                 if self.actor_cnns[obs_group].output_channels is None:
                     encoding_dim += int(self.actor_cnns[obs_group].output_dim)  # type: ignore
@@ -126,27 +143,28 @@ class ActorCriticCNN(ActorCritic):
             self.actor_obs_normalizer = torch.nn.Identity()
 
         # Critic CNN
-        if self.critic_obs_groups_2d:
+        if self.critic_obs_groups_nd:
             # Resolve the critic CNN configuration
-            assert critic_cnn_cfg is not None, "A critic CNN configuration is required for 2D critic observations."
-            # If a single configuration dictionary is provided, create a dictionary for each 2D observation group
+            assert critic_cnn_cfg is not None, "A critic CNN configuration is required for image critic observations."
+            # If a single configuration dictionary is provided, create a dictionary for each image observation group
             if not all(isinstance(v, dict) for v in critic_cnn_cfg.values()):
-                critic_cnn_cfg = {group: critic_cnn_cfg for group in self.critic_obs_groups_2d}
+                critic_cnn_cfg = {group: critic_cnn_cfg for group in self.critic_obs_groups_nd}
             # Check that the number of configs matches the number of observation groups
-            assert len(critic_cnn_cfg) == len(self.critic_obs_groups_2d), (
-                "The number of CNN configurations must match the number of 2D critic observations."
+            assert len(critic_cnn_cfg) == len(self.critic_obs_groups_nd), (
+                "The number of CNN configurations must match the number of image critic observations."
             )
 
-            # Create CNNs for each 2D critic observation
+            # Create CNNs for each image critic observation
             self.critic_cnns = nn.ModuleDict()
             encoding_dim = 0
-            for idx, obs_group in enumerate(self.critic_obs_groups_2d):
-                self.critic_cnns[obs_group] = CNN(
-                    input_dim=critic_in_dims_2d[idx],
-                    input_channels=critic_in_channels_2d[idx],
+            for idx, obs_group in enumerate(self.critic_obs_groups_nd):
+                cnn_class = CNN3D if self.critic_obs_ndim[obs_group] == 5 else CNN
+                self.critic_cnns[obs_group] = cnn_class(
+                    input_dim=critic_in_dims_nd[idx],
+                    input_channels=critic_in_channels_nd[idx],
                     **critic_cnn_cfg[obs_group],
                 )
-                print(f"Critic CNN for {obs_group}: {self.critic_cnns[obs_group]}")
+                print(f"Critic {'CNN3D' if self.critic_obs_ndim[obs_group] == 5 else 'CNN'} for {obs_group}: {self.critic_cnns[obs_group]}")
                 # Get the output dimension of the CNN
                 if self.critic_cnns[obs_group].output_channels is None:
                     encoding_dim += int(self.critic_cnns[obs_group].output_dim)  # type: ignore
@@ -196,8 +214,8 @@ class ActorCriticCNN(ActorCritic):
 
     def _update_distribution(self, mlp_obs: torch.Tensor, cnn_obs: dict[str, torch.Tensor]) -> None:
         if self.actor_cnns is not None:
-            # Encode the 2D actor observations
-            cnn_enc_list = [self.actor_cnns[obs_group](cnn_obs[obs_group]) for obs_group in self.actor_obs_groups_2d]
+            # Encode the image actor observations
+            cnn_enc_list = [self.actor_cnns[obs_group](cnn_obs[obs_group]) for obs_group in self.actor_obs_groups_nd]
             cnn_enc = torch.cat(cnn_enc_list, dim=-1)
             # Concatenate to the MLP observations
             mlp_obs = torch.cat([mlp_obs, cnn_enc], dim=-1)
@@ -215,8 +233,8 @@ class ActorCriticCNN(ActorCritic):
         mlp_obs = self.actor_obs_normalizer(mlp_obs)
 
         if self.actor_cnns is not None:
-            # Encode the 2D actor observations
-            cnn_enc_list = [self.actor_cnns[obs_group](cnn_obs[obs_group]) for obs_group in self.actor_obs_groups_2d]
+            # Encode the image actor observations
+            cnn_enc_list = [self.actor_cnns[obs_group](cnn_obs[obs_group]) for obs_group in self.actor_obs_groups_nd]
             cnn_enc = torch.cat(cnn_enc_list, dim=-1)
             # Concatenate to the MLP observations
             mlp_obs = torch.cat([mlp_obs, cnn_enc], dim=-1)
@@ -231,8 +249,8 @@ class ActorCriticCNN(ActorCritic):
         mlp_obs = self.critic_obs_normalizer(mlp_obs)
 
         if self.critic_cnns is not None:
-            # Encode the 2D critic observations
-            cnn_enc_list = [self.critic_cnns[obs_group](cnn_obs[obs_group]) for obs_group in self.critic_obs_groups_2d]
+            # Encode the image critic observations
+            cnn_enc_list = [self.critic_cnns[obs_group](cnn_obs[obs_group]) for obs_group in self.critic_obs_groups_nd]
             cnn_enc = torch.cat(cnn_enc_list, dim=-1)
             # Concatenate to the MLP observations
             mlp_obs = torch.cat([mlp_obs, cnn_enc], dim=-1)
@@ -241,17 +259,17 @@ class ActorCriticCNN(ActorCritic):
 
     def get_actor_obs(self, obs: TensorDict) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         obs_list_1d = [obs[obs_group] for obs_group in self.actor_obs_groups_1d]
-        obs_dict_2d = {}
-        for obs_group in self.actor_obs_groups_2d:
-            obs_dict_2d[obs_group] = obs[obs_group]
-        return torch.cat(obs_list_1d, dim=-1), obs_dict_2d
+        obs_dict_nd = {}
+        for obs_group in self.actor_obs_groups_nd:
+            obs_dict_nd[obs_group] = obs[obs_group]
+        return torch.cat(obs_list_1d, dim=-1), obs_dict_nd
 
     def get_critic_obs(self, obs: TensorDict) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         obs_list_1d = [obs[obs_group] for obs_group in self.critic_obs_groups_1d]
-        obs_dict_2d = {}
-        for obs_group in self.critic_obs_groups_2d:
-            obs_dict_2d[obs_group] = obs[obs_group]
-        return torch.cat(obs_list_1d, dim=-1), obs_dict_2d
+        obs_dict_nd = {}
+        for obs_group in self.critic_obs_groups_nd:
+            obs_dict_nd[obs_group] = obs[obs_group]
+        return torch.cat(obs_list_1d, dim=-1), obs_dict_nd
 
     def update_normalization(self, obs: TensorDict) -> None:
         if self.actor_obs_normalization:
