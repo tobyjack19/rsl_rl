@@ -1,26 +1,26 @@
-# Copyright (c) 2021-2025, ETH Zurich and NVIDIA CORPORATION
-# All rights reserved.
-#
-# SPDX-License-Identifier: BSD-3-Clause
-
+from ipdb import set_trace
 import torch
 import torch.nn as nn
 from tensordict import TensorDict
 
-from rsl_rl.modules import StudentTeacher, StudentTeacherRecurrent, StudentTeacherCNN,  StudentTeacherCNNRNN
+from rsl_rl.modules import StudentTeacherExtrinsics, StudentTeacherMultiModalExtrinsics
 from rsl_rl.storage import RolloutStorage
 from rsl_rl.utils import resolve_optimizer
 
 
-class Distillation:
-    """Distillation algorithm for training a student model to mimic a teacher model."""
+class ExtrinsicsDistillation:
+    """
+    Stage-2 distillation algorithm for extrinsics encoder.
 
-    policy: StudentTeacher | StudentTeacherRecurrent | StudentTeacherCNN | StudentTeacherCNNRNN
-    """The student teacher model."""
+    Trains student_extrinsics_encoder to match
+    teacher_extrinsics_encoder outputs.
+    """
+
+    policy: StudentTeacherExtrinsics | StudentTeacherMultiModalExtrinsics
 
     def __init__(
         self,
-        policy: StudentTeacher | StudentTeacherRecurrent | StudentTeacherCNN | StudentTeacherCNNRNN,
+        policy: StudentTeacherExtrinsics | StudentTeacherMultiModalExtrinsics,
         num_learning_epochs: int = 1,
         gradient_length: int = 15,
         learning_rate: float = 1e-3,
@@ -28,14 +28,15 @@ class Distillation:
         loss_type: str = "mse",
         optimizer: str = "adam",
         device: str = "cpu",
-        # Distributed training parameters
         multi_gpu_cfg: dict | None = None,
     ) -> None:
-        # Device-related parameters
+
+        # -----------------------
+        # Device / Multi-GPU
+        # -----------------------
         self.device = device
         self.is_multi_gpu = multi_gpu_cfg is not None
 
-        # Multi-GPU parameters
         if multi_gpu_cfg is not None:
             self.gpu_global_rank = multi_gpu_cfg["global_rank"]
             self.gpu_world_size = multi_gpu_cfg["world_size"]
@@ -43,45 +44,62 @@ class Distillation:
             self.gpu_global_rank = 0
             self.gpu_world_size = 1
 
-        # Distillation components
+        # -----------------------
+        # Policy
+        # -----------------------
         self.policy = policy
         self.policy.to(self.device)
-        self.storage = None  # Initialized later
+        self.storage = None  # created later
 
-        # Initialize the optimizer
-        self.optimizer = resolve_optimizer(optimizer)(self.policy.parameters(), lr=learning_rate)
+        # -----------------------
+        # IMPORTANT:
+        # Only optimize student_extrinsics_encoder
+        # -----------------------
+        student_params = self.policy.student_extrinsics_encoder.parameters()
 
-        # Initialize the transition
+        self.optimizer = resolve_optimizer(optimizer)(student_params, lr=learning_rate,)
+
+        # -----------------------
+        # Transition buffer
+        # -----------------------
         self.transition = RolloutStorage.Transition()
         self.last_hidden_states = (None, None)
 
-        # Distillation parameters
+        # -----------------------
+        # Hyperparameters
+        # -----------------------
         self.num_learning_epochs = num_learning_epochs
         self.gradient_length = gradient_length
         self.learning_rate = learning_rate
         self.max_grad_norm = max_grad_norm
 
-        # Initialize the loss function
+        # -----------------------
+        # Loss function
+        # -----------------------
         loss_fn_dict = {
             "mse": nn.functional.mse_loss,
             "huber": nn.functional.huber_loss,
         }
+
         if loss_type in loss_fn_dict:
             self.loss_fn = loss_fn_dict[loss_type]
         else:
-            raise ValueError(f"Unknown loss type: {loss_type}. Supported types are: {list(loss_fn_dict.keys())}")
+            raise ValueError(
+                f"Unknown loss type: {loss_type}. "
+                f"Supported types: {list(loss_fn_dict.keys())}"
+            )
 
         self.num_updates = 0
 
     def init_storage(
         self,
-        training_type: str,  # "distillation" or "rl"
+        training_type: str,
         num_envs: int,
         num_transitions_per_env: int,
         obs: TensorDict,
         actions_shape: tuple[int],
     ) -> None:
-        # Create rollout storage
+
         self.storage = RolloutStorage(
             training_type,
             num_envs,
@@ -89,14 +107,15 @@ class Distillation:
             obs,
             actions_shape,
             self.device,
+            (self.policy.extrinsics_output_dim,),
         )
 
     def act(self, obs: TensorDict) -> torch.Tensor:
-        # Compute the actions
         self.transition.actions = self.policy.act(obs).detach()
-        self.transition.privileged_actions = self.policy.evaluate(obs).detach()
-        # Record the observations
+        # store teacher extrinsics as "privileged actions"
+        self.transition.privileged_latents = self.policy.get_teacher_extrinsics(obs).detach()
         self.transition.observations = obs
+
         return self.transition.actions
 
     def process_env_step(
@@ -114,51 +133,66 @@ class Distillation:
         self.policy.reset(dones)
 
     def update(self) -> dict[str, float]:
+
         self.num_updates += 1
-        mean_behavior_loss = 0
+        mean_loss = 0
         loss = 0
         cnt = 0
 
         for epoch in range(self.num_learning_epochs):
+
             self.policy.reset(hidden_states=self.last_hidden_states)
             self.policy.detach_hidden_states()
-            for obs, _, privileged_actions, dones in self.storage.generator():
-                # Inference of the student for gradient computation
-                actions = self.policy.act_inference(obs)
 
-                # Behavior cloning loss
-                behavior_loss = self.loss_fn(actions, privileged_actions)
+            for obs, _, teacher_z, dones in self.storage.generator():
 
-                # Total loss
+                # --- Student extrinsics ---
+                student_z = self.policy.get_student_extrinsics(obs)
+
+                # --- Behavior cloning on latent ---
+                behavior_loss = self.loss_fn(
+                    # TODO: try with and with tanh
+                    # torch.tanh(student_z),
+                    # torch.tanh(teacher_z.detach()),
+                    student_z,
+                    teacher_z.detach(),
+                )
+
                 loss = loss + behavior_loss
-                mean_behavior_loss += behavior_loss.item()
+                mean_loss += behavior_loss.item()
                 cnt += 1
 
-                # Gradient step
+                # Gradient accumulation
                 if cnt % self.gradient_length == 0:
+
                     self.optimizer.zero_grad()
                     loss.backward()
+
                     if self.is_multi_gpu:
                         self.reduce_parameters()
+
                     if self.max_grad_norm:
-                        nn.utils.clip_grad_norm_(self.policy.student.parameters(), self.max_grad_norm)
+                        nn.utils.clip_grad_norm_(
+                            self.policy.student_extrinsics_encoder.parameters(),
+                            self.max_grad_norm,
+                        )
+
                     self.optimizer.step()
+
                     self.policy.detach_hidden_states()
                     loss = 0
 
-                # Reset dones
+                # Reset on dones
                 self.policy.reset(dones.view(-1))
                 self.policy.detach_hidden_states(dones.view(-1))
 
-        mean_behavior_loss /= cnt
+        mean_loss /= cnt
         self.storage.clear()
+
         self.last_hidden_states = self.policy.get_hidden_states()
         self.policy.detach_hidden_states()
 
-        # Construct the loss dictionary
-        loss_dict = {"behavior": mean_behavior_loss}
-
-        return loss_dict
+        return {"extrinsics_mse": mean_loss}
 
     def broadcast_parameters(self) -> None:
         """Broadcast model parameters to all GPUs."""
@@ -175,14 +209,18 @@ class Distillation:
         This function is called after the backward pass to synchronize the gradients across all GPUs.
         """
         # Create a tensor to store the gradients
-        grads = [param.grad.view(-1) for param in self.policy.parameters() if param.grad is not None]
+        grads = [
+            param.grad.view(-1)
+            for param in self.policy.student_extrinsics_encoder.parameters()
+            if param.grad is not None
+        ]
         all_grads = torch.cat(grads)
         # Average the gradients across all GPUs
         torch.distributed.all_reduce(all_grads, op=torch.distributed.ReduceOp.SUM)
         all_grads /= self.gpu_world_size
         # Update the gradients for all parameters with the reduced gradients
         offset = 0
-        for param in self.policy.parameters():
+        for param in self.policy.student_extrinsics_encoder.parameters():
             if param.grad is not None:
                 numel = param.numel()
                 # Copy data back from shared buffer

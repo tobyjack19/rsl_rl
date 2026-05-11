@@ -12,10 +12,10 @@ from tensordict import TensorDict
 from torch.distributions import Normal
 from typing import Any, NoReturn
 
-from rsl_rl.networks import MLP, EmpiricalNormalization, HiddenState, Memory
+from rsl_rl.networks import MLP, EmpiricalNormalization, HiddenState, Memory, CNN
 
 
-class StudentTeacherRecurrent(nn.Module):
+class StudentTeacherCNNRNN(nn.Module):
     is_recurrent: bool = True
 
     def __init__(
@@ -34,6 +34,7 @@ class StudentTeacherRecurrent(nn.Module):
         rnn_hidden_dim: int = 256,
         rnn_num_layers: int = 1,
         teacher_recurrent: bool = False,
+        student_cnn_cfg: dict[str, dict] | dict | None = None,
         **kwargs: dict[str, Any],
     ) -> None:
         if "rnn_hidden_size" in kwargs:
@@ -56,27 +57,83 @@ class StudentTeacherRecurrent(nn.Module):
 
         # Get the observation dimensions
         self.obs_groups = obs_groups
-        num_student_obs = 0
+        # num_student_obs = 0
+        num_student_obs_1d = 0
+        self.student_obs_groups_1d = []
+        student_in_dims_2d = []  # H, W (input image height and width for CNN)
+        student_in_channels_2d = []  # C (input image channels for CNN)
+        self.student_obs_groups_2d = []
+
+        
         for obs_group in obs_groups["policy"]:
-            assert len(obs[obs_group].shape) == 2, "The StudentTeacher module only supports 1D observations."
-            num_student_obs += obs[obs_group].shape[-1]
+            # assert len(obs[obs_group].shape) == 2, "The StudentTeacher module only supports 1D observations."
+            # num_student_obs += obs[obs_group].shape[-1]
+            if len(obs[obs_group].shape) == 4:  # B, C, H, W
+                self.student_obs_groups_2d.append(obs_group)
+                student_in_dims_2d.append(obs[obs_group].shape[2:4])  # H, W
+                student_in_channels_2d.append(obs[obs_group].shape[1])  # C
+            elif len(obs[obs_group].shape) == 2:  # B, C
+                self.student_obs_groups_1d.append(obs_group)
+                num_student_obs_1d += obs[obs_group].shape[-1]
+            else:
+                raise ValueError(f"Invalid observation shape for {obs_group}: {obs[obs_group].shape}")
+
+        # Teacher
         num_teacher_obs = 0
         for obs_group in obs_groups["teacher"]:
             assert len(obs[obs_group].shape) == 2, "The StudentTeacher module only supports 1D observations."
             num_teacher_obs += obs[obs_group].shape[-1]
 
-        # Student
-        self.memory_s = Memory(num_student_obs, rnn_hidden_dim, rnn_num_layers, rnn_type)
+
+        # Student CNN
+        if self.student_obs_groups_2d:
+            # Resolve the student CNN configuration
+            assert student_cnn_cfg is not None, "A student CNN configuration is required for 2D student observations."
+            # If a single configuration dictionary is provided, create a dictionary for each 2D observation group
+            if not all(isinstance(v, dict) for v in student_cnn_cfg.values()):
+                student_cnn_cfg = {group: student_cnn_cfg for group in self.student_obs_groups_2d}
+            # Check that the number of configs matches the number of observation groups
+            assert len(student_cnn_cfg) == len(self.student_obs_groups_2d), (
+                "The number of CNN configurations must match the number of 2D student observations."
+            )
+            # Create CNNs for each 2D student observation
+            self.student_cnns = nn.ModuleDict()
+            encoding_dim = 0
+            for idx, obs_group in enumerate(self.student_obs_groups_2d):
+                self.student_cnns[obs_group] = CNN(
+                    input_dim=student_in_dims_2d[idx],
+                    input_channels=student_in_channels_2d[idx],
+                    **student_cnn_cfg[obs_group],
+                )
+                print(f"Student CNN for {obs_group}: {self.student_cnns[obs_group]}")
+                # Get the output dimension of the CNN
+                if self.student_cnns[obs_group].output_channels is None:
+                    encoding_dim += int(self.student_cnns[obs_group].output_dim)  # type: ignore
+                else:
+                    raise ValueError("The output of the student CNN must be flattened before passing it to the MLP.")
+        else:
+            self.student_cnns = None
+            encoding_dim = 0
+
+        # Student RNN
+
+        self.memory_s = Memory(num_student_obs_1d + encoding_dim, rnn_hidden_dim, rnn_num_layers, rnn_type)
         self.student = MLP(rnn_hidden_dim, num_actions, student_hidden_dims, activation)
+
+        # print(f"Student obs groups 1D: {self.student_obs_groups_1d}")
+        # print(f"Student obs groups 2D: {self.student_obs_groups_2d}")
+        print(f"Student CNN: {self.student_cnns}")
         print(f"Student RNN: {self.memory_s}")
         print(f"Student MLP: {self.student}")
 
         # Student observation normalization
         self.student_obs_normalization = student_obs_normalization
         if student_obs_normalization:
-            self.student_obs_normalizer = EmpiricalNormalization(num_student_obs)
+            assert not self.student_cnns, "Observation normalization is not supported for 2D student observations. Please disable student_obs_normalization or remove the student CNN."
+            # self.student_obs_normalizer = EmpiricalNormalization(num_student_obs)
         else:
             self.student_obs_normalizer = torch.nn.Identity()
+
 
         # Teacher
         if self.teacher_recurrent:
@@ -145,17 +202,35 @@ class StudentTeacherRecurrent(nn.Module):
         # Create distribution
         self.distribution = Normal(mean, std)
 
+
+    
     def act(self, obs: TensorDict) -> torch.Tensor:
-        obs = self.get_student_obs(obs)
-        obs = self.student_obs_normalizer(obs)
-        out_mem = self.memory_s(obs).squeeze(0)
+        mlp_obs, cnn_obs = self.get_student_1d_and_2d_obs(obs)
+        mlp_obs = self.student_obs_normalizer(mlp_obs)
+        if self.student_cnns is not None:
+            # Encode the 2D student observations
+            cnn_enc_list = [self.student_cnns[obs_group](cnn_obs[obs_group]) for obs_group in self.student_obs_groups_2d]
+            cnn_enc = torch.cat(cnn_enc_list, dim=-1)
+            # Concatenate to the MLP observations
+            rnn_in = torch.cat([mlp_obs, cnn_enc], dim=-1)
+        else:
+            rnn_in = mlp_obs
+        out_mem = self.memory_s(rnn_in).squeeze(0)
         self._update_distribution(out_mem)
         return self.distribution.sample()
 
     def act_inference(self, obs: TensorDict) -> torch.Tensor:
-        obs = self.get_student_obs(obs)
-        obs = self.student_obs_normalizer(obs)
-        out_mem = self.memory_s(obs).squeeze(0)
+        mlp_obs, cnn_obs = self.get_student_1d_and_2d_obs(obs)
+        mlp_obs = self.student_obs_normalizer(mlp_obs)
+        if self.student_cnns is not None:
+            # Encode the 2D student observations
+            cnn_enc_list = [self.student_cnns[obs_group](cnn_obs[obs_group]) for obs_group in self.student_obs_groups_2d]
+            cnn_enc = torch.cat(cnn_enc_list, dim=-1)
+            # Concatenate to the MLP observations
+            rnn_in = torch.cat([mlp_obs, cnn_enc], dim=-1)
+        else:
+            rnn_in = mlp_obs
+        out_mem = self.memory_s(rnn_in).squeeze(0)
         return self.student(out_mem)
 
     def evaluate(self, obs: TensorDict) -> torch.Tensor:
@@ -167,9 +242,12 @@ class StudentTeacherRecurrent(nn.Module):
                 obs = self.memory_t(obs).squeeze(0)
             return self.teacher(obs)
 
-    def get_student_obs(self, obs: TensorDict) -> torch.Tensor:
-        obs_list = [obs[obs_group] for obs_group in self.obs_groups["policy"]]
-        return torch.cat(obs_list, dim=-1)
+    def get_student_1d_and_2d_obs(self, obs: TensorDict) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        obs_list_1d = [obs[obs_group] for obs_group in self.student_obs_groups_1d]
+        obs_dict_2d = {}
+        for obs_group in self.student_obs_groups_2d:
+            obs_dict_2d[obs_group] = obs[obs_group]
+        return torch.cat(obs_list_1d, dim=-1), obs_dict_2d
 
     def get_teacher_obs(self, obs: TensorDict) -> torch.Tensor:
         obs_list = [obs[obs_group] for obs_group in self.obs_groups["teacher"]]
@@ -194,8 +272,9 @@ class StudentTeacherRecurrent(nn.Module):
 
     def update_normalization(self, obs: TensorDict) -> None:
         if self.student_obs_normalization:
-            student_obs = self.get_student_obs(obs)
-            self.student_obs_normalizer.update(student_obs)
+            assert not self.student_cnns, "Observation normalization is not supported for 2D student observations. Please disable student_obs_normalization or remove the student CNN."
+            # student_obs = self.get_student_1d_and_2d_obs(obs)
+            # self.student_obs_normalizer.update(student_obs)
 
     def load_state_dict(self, state_dict: dict, strict: bool = True) -> bool:
         """Load the parameters of the student and teacher networks.

@@ -1,53 +1,51 @@
-# Copyright (c) 2021-2025, ETH Zurich and NVIDIA CORPORATION
-# All rights reserved.
-#
-# SPDX-License-Identifier: BSD-3-Clause
-
-from __future__ import annotations
-
 import os
 import time
+import statistics
 import torch
 from collections import deque
 from tensordict import TensorDict
-import statistics
 
 import rsl_rl
-from rsl_rl.algorithms import Distillation
 from rsl_rl.env import VecEnv
-from rsl_rl.modules import StudentTeacher, StudentTeacherRecurrent, StudentTeacherCNN, StudentTeacherCNNRNN
-from rsl_rl.runners import OnPolicyRunner
 from rsl_rl.utils import resolve_obs_groups, store_code_state
-from ipdb import set_trace
+from rsl_rl.algorithms import ExtrinsicsDistillation
+from rsl_rl.modules import StudentTeacherExtrinsics, StudentTeacherMultiModalExtrinsics
+from rsl_rl.runners import OnPolicyRunner
 
-class DistillationRunner(OnPolicyRunner):
-    """On-policy runner for training and evaluation of teacher-student training."""
 
-    def __init__(self, env: VecEnv, train_cfg: dict, log_dir: str | None = None, device: str = "cpu") -> None:
+class ExtrinsicsDistillationRunner(OnPolicyRunner):
+    """
+    Runner for Stage-2 extrinsics distillation.
+    """
+
+    def __init__(self, env: VecEnv, train_cfg: dict, log_dir: str | None = None, device: str = "cpu"):
+
         self.cfg = train_cfg
         self.alg_cfg = train_cfg["algorithm"]
         self.policy_cfg = train_cfg["policy"]
+
         self.device = device
         self.env = env
+        self.log_dir = log_dir
 
-        # Check if multi-GPU is enabled
         self._configure_multi_gpu()
-
-        # Store training configuration
+        
         self.num_steps_per_env = self.cfg["num_steps_per_env"]
         self.save_interval = self.cfg["save_interval"]
-        # Query observations from environment for algorithm construction
-        obs = self.env.get_observations()
-        self.cfg["obs_groups"] = resolve_obs_groups(obs, self.cfg["obs_groups"], default_sets=["teacher"])
 
-        # Create the algorithm
+        # Resolve observation groups
+        obs = self.env.get_observations()
+        self.cfg["obs_groups"] = resolve_obs_groups(
+            obs,
+            self.cfg["obs_groups"],
+            default_sets=["priv", "obs", "obs_hist"]
+        )
+
+        # Construct algorithm
         self.alg = self._construct_algorithm(obs)
 
-        # Decide whether to disable logging
-        # Note: We only log from the process with rank 0 (main process)
         self.disable_logs = self.is_distributed and self.gpu_global_rank != 0
 
-        # Logging
         self.log_dir = log_dir
         self.writer = None
         self.tot_timesteps = 0
@@ -55,6 +53,7 @@ class DistillationRunner(OnPolicyRunner):
         self.current_learning_iteration = 0
         self.git_status_repos = [rsl_rl.__file__]
 
+    # LEARN
     def learn(self, num_learning_iterations: int, init_at_random_ep_len: bool = False) -> None:
         # Initialize writer
         self._prepare_logging_writer()
@@ -135,14 +134,11 @@ class DistillationRunner(OnPolicyRunner):
             if self.log_dir is not None and not self.disable_logs:
                 # Log information
                 self.log(locals())
-
-                # ========== Distillation mode: track BC loss ==========
                 # set_trace()
+                if "extrinsics_mse" in loss_dict:
 
-                if "behavior" in loss_dict:
-
-                    bc_loss = float(loss_dict["behavior"])
-                    if it > 200:   # avoid noise before any complete episodes
+                    bc_loss = float(loss_dict["extrinsics_mse"])
+                    if it > 100:   # avoid noise before any complete episodes
                         if bc_loss < best_bc_loss:
                             best_bc_loss = bc_loss
                             print(
@@ -157,7 +153,7 @@ class DistillationRunner(OnPolicyRunner):
 
                 # ========== PPO mode: track reward ==========
                 else:
-                    if it > 200:  # avoid noise in early iterations
+                    if it > 100:  # avoid noise in early iterations
                         mean_rew = statistics.mean(rewbuffer)
 
                         if mean_rew > best_mean_reward:
@@ -186,23 +182,29 @@ class DistillationRunner(OnPolicyRunner):
         if self.log_dir is not None and not self.disable_logs:
             self.save(os.path.join(self.log_dir, f"model_{self.current_learning_iteration}.pt"))
 
-    def _construct_algorithm(self, obs: TensorDict) -> Distillation:
-        """Construct the distillation algorithm."""
-        # Initialize the policy
-        student_teacher_class = eval(self.policy_cfg.pop("class_name"))
-        student_teacher: StudentTeacher | StudentTeacherRecurrent | StudentTeacherCNN | StudentTeacherCNNRNN = student_teacher_class(
-            obs, self.cfg["obs_groups"], self.env.num_actions, **self.policy_cfg
+    def _construct_algorithm(self, obs: TensorDict):
+
+        policy_cfg = self.policy_cfg.copy()
+        alg_cfg = self.alg_cfg.copy()
+
+        student_teacher_class = eval(policy_cfg.pop("class_name"))
+        student_teacher = student_teacher_class(
+            obs,
+            self.cfg["obs_groups"],
+            self.env.num_actions,
+            **policy_cfg,
         ).to(self.device)
 
-        # Initialize the algorithm
-        alg_class = eval(self.alg_cfg.pop("class_name"))
-        alg: Distillation = alg_class(
-            student_teacher, device=self.device, **self.alg_cfg, multi_gpu_cfg=self.multi_gpu_cfg
+        alg_class = eval(alg_cfg.pop("class_name"))
+        alg: ExtrinsicsDistillation = alg_class(
+            student_teacher,
+            device=self.device,
+            **alg_cfg,
+            multi_gpu_cfg=self.multi_gpu_cfg,
         )
 
-        # Initialize the storage
         alg.init_storage(
-            "distillation",
+            "extrinsics_distillation",
             self.env.num_envs,
             self.num_steps_per_env,
             obs,
@@ -210,3 +212,47 @@ class DistillationRunner(OnPolicyRunner):
         )
 
         return alg
+
+    def _configure_multi_gpu(self) -> None:
+        """Configure multi-gpu training."""
+        # Check if distributed training is enabled
+        self.gpu_world_size = int(os.getenv("WORLD_SIZE", "1"))
+        self.is_distributed = self.gpu_world_size > 1
+
+        # If not distributed training, set local and global rank to 0 and return
+        if not self.is_distributed:
+            self.gpu_local_rank = 0
+            self.gpu_global_rank = 0
+            self.multi_gpu_cfg = None
+            return
+
+        # Get rank and world size
+        self.gpu_local_rank = int(os.getenv("LOCAL_RANK", "0"))
+        self.gpu_global_rank = int(os.getenv("RANK", "0"))
+
+        # Make a configuration dictionary
+        self.multi_gpu_cfg = {
+            "global_rank": self.gpu_global_rank,  # Rank of the main process
+            "local_rank": self.gpu_local_rank,  # Rank of the current process
+            "world_size": self.gpu_world_size,  # Total number of processes
+        }
+
+        # Check if user has device specified for local rank
+        if self.device != f"cuda:{self.gpu_local_rank}":
+            raise ValueError(
+                f"Device '{self.device}' does not match expected device for local rank '{self.gpu_local_rank}'."
+            )
+        # Validate multi-gpu configuration
+        if self.gpu_local_rank >= self.gpu_world_size:
+            raise ValueError(
+                f"Local rank '{self.gpu_local_rank}' is greater than or equal to world size '{self.gpu_world_size}'."
+            )
+        if self.gpu_global_rank >= self.gpu_world_size:
+            raise ValueError(
+                f"Global rank '{self.gpu_global_rank}' is greater than or equal to world size '{self.gpu_world_size}'."
+            )
+
+        # Initialize torch distributed
+        torch.distributed.init_process_group(backend="nccl", rank=self.gpu_global_rank, world_size=self.gpu_world_size)
+        # Set device to the local rank
+        torch.cuda.set_device(self.gpu_local_rank)
