@@ -7,6 +7,7 @@
 
 from .cnn import CNN
 from .cnn3d import CNN3D
+from .cnn_tsm import CNNTSM
 from .memory import HiddenState, Memory
 from .mlp import MLP
 from .normalization import EmpiricalDiscountedVariationNormalization, EmpiricalNormalization
@@ -14,6 +15,7 @@ from .normalization import EmpiricalDiscountedVariationNormalization, EmpiricalN
 __all__ = [
     "CNN",
     "CNN3D",
+    "CNNTSM",
     "MLP",
     "EmpiricalDiscountedVariationNormalization",
     "EmpiricalNormalization",

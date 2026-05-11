@@ -33,16 +33,6 @@ import Tactile_Lab
 from pathlib import Path  # instead of `import pathlib as Path`
 
 TACTILE_LAB_SRC = Path(Tactile_Lab.__file__).resolve().parent
-_PARAMS_DIR = Path(TACTILE_LAB_SRC).joinpath("tasks/direct/obj_push_codesign/codesign_toolkit/Codesign_Assets/params")
-reward_history_dir = Path(TACTILE_LAB_SRC).joinpath("tasks/direct/obj_push_codesign/codesign_toolkit/Codesign_Assets/reward_history")
-params_path = _PARAMS_DIR.joinpath("current_params.json")
-
-rewbuffer_path = reward_history_dir.joinpath("rewbuffer.pkl")
-lenbuffer_path = reward_history_dir.joinpath("lenbuffer.pkl")
-windowed_attempt_buffer_path = reward_history_dir.joinpath("windowed_attempt_buffer.pkl")
-reward_history_path = reward_history_dir.joinpath("reward_history.json")
-per_iteration_hardware_reward_history_path = reward_history_dir.joinpath(f"per_iteration_hardware_reward_history.json")
-per_iteration_hardware_parameters_path = reward_history_dir.joinpath(f"per_iteration_hardware_parameters.json")
 
 class OnPolicyCoDesignRunner:
     """On-policy runner for training and evaluation of actor-critic methods."""
@@ -84,6 +74,38 @@ class OnPolicyCoDesignRunner:
         self.current_learning_iteration = 1
         self.git_status_repos = [rsl_rl.__file__]
 
+        # Resolve codesign assets directory from config or experiment_name convention.
+        if self.cfg.get("codesign_assets_dir") is not None:
+            _assets_dir = Path(self.cfg["codesign_assets_dir"])
+        else:
+            _assets_dir = (
+                TACTILE_LAB_SRC
+                / "tasks" / "direct"
+                / self.cfg["experiment_name"]
+                / "codesign_toolkit" / "Codesign_Assets"
+            )
+        if not _assets_dir.exists():
+            warnings.warn(
+                f"[OnPolicyCoDesignRunner] codesign_assets_dir not found: {_assets_dir}. "
+                "Set 'codesign_assets_dir' in the runner config or check experiment_name."
+            )
+
+        self._params_path = _assets_dir / "params" / "current_params.json"
+        self._reward_history_dir = _assets_dir / "reward_history"
+        self._reward_history_dir.mkdir(parents=True, exist_ok=True)
+        self._rewbuffer_path = self._reward_history_dir / "rewbuffer.pkl"
+        self._lenbuffer_path = self._reward_history_dir / "lenbuffer.pkl"
+        self._windowed_attempt_buffer_path = self._reward_history_dir / "windowed_attempt_buffer.pkl"
+        self._reward_history_path = self._reward_history_dir / "reward_history.json"
+        self._per_iteration_hw_reward_history_path = self._reward_history_dir / "per_iteration_hardware_reward_history.json"
+        self._per_iteration_hw_parameters_path = self._reward_history_dir / "per_iteration_hardware_parameters.json"
+
+        if not self._params_path.exists():
+            warnings.warn(
+                f"[OnPolicyCoDesignRunner] params file not found: {self._params_path}. "
+                "Ensure current_params.json exists before calling learn()."
+            )
+
     def learn(
         self,
         num_learning_iterations: int,
@@ -106,11 +128,11 @@ class OnPolicyCoDesignRunner:
 
         # Book keeping
         ep_infos = []
-        maxbufferlength = 256 #512
-        successwindowmaxbufferlength = 1024 #2048 # 768 512
-        per_it_bufferlength = 2048
+        maxbufferlength = 256 #256 #512
+        successwindowmaxbufferlength = 1024 #1024 #2048 # 768 512
+        per_it_bufferlength = 2048 #2048
         cnn_skip_iterations = 0  # freeze CNN encoder for this many iterations after morphology change
-        policy_warmup_iterations = 30  # number of iterations to warmup the policy after morphology change before logging rewards and allowing saves (to avoid noise from initial performance drop)
+        policy_warmup_iterations = 10 # 30 for sync codesign  # number of iterations to warmup the policy after morphology change before logging rewards and allowing saves (to avoid noise from initial performance drop)
         rew_skip_iterations = policy_warmup_iterations  # number of iterations to skip from reward buffer after task reset
         cnn_frozen = False
         per_it_success_ratio = 0.0  # track latest successes/attempts ratio for this hardware iteration
@@ -128,14 +150,14 @@ class OnPolicyCoDesignRunner:
             historical_attempt_count = float(0)
             historical_success_count = float(0)
         else:
-            with open(rewbuffer_path, "rb") as f:
+            with open(self._rewbuffer_path, "rb") as f:
                 rewbuffer = pickle.load(f)
-            with open(lenbuffer_path, "rb") as f:
+            with open(self._lenbuffer_path, "rb") as f:
                 lenbuffer = pickle.load(f)
-            with open(windowed_attempt_buffer_path, "rb") as f:
+            with open(self._windowed_attempt_buffer_path, "rb") as f:
                 windowed_attempt_buffer = pickle.load(f)
             self.env.unwrapped.windowed_attempt_buffer = windowed_attempt_buffer  # share with env for _get_dones updates
-            with open(reward_history_path, "r", encoding="utf-8") as f:
+            with open(self._reward_history_path, "r", encoding="utf-8") as f:
                 reward_history_dict = json.load(f)
             best_mean_reward = reward_history_dict.get("best_mean_reward", -float("inf"))
 
@@ -143,16 +165,9 @@ class OnPolicyCoDesignRunner:
         per_it_best_mean_reward = -float("inf")  # best rolling mean reward within this hardware iteration (for HEBO observation)
 
         # -------- Load current hardware design parameters --------
-        with open(params_path, "r", encoding="utf-8") as f:
-                    params = json.load(f)
-
-        params_dict = {
-            "base_sphere_centre_z_offset": float(params["base_sphere_centre_z_offset"]),
-            "concave_dimple_diameter": float(params["concave_dimple_diameter"]),
-            "convex_dimple_diameter": float(params["convex_dimple_diameter"]),
-            "concave_dimple_depth_scale": float(params["concave_dimple_depth_scale"]),
-            "convex_dimple_height_scale": float(params["convex_dimple_height_scale"]),
-        }
+        with open(self._params_path, "r", encoding="utf-8") as f:
+            params = json.load(f)
+        params_dict = {k: float(v) for k, v in params.items()}
 
         cur_reward_sum = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
         cur_episode_length = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
@@ -226,6 +241,9 @@ class OnPolicyCoDesignRunner:
                         cur_episode_length += 1
                         # Clear data for completed episodes
                         new_ids = (dones > 0).nonzero(as_tuple=False)
+                        # Reset TSM caches for environments that just finished an episode.
+                        if new_ids.numel() > 0 and hasattr(self.alg.policy, "reset_cache"):
+                            self.alg.policy.reset_cache(new_ids.squeeze(-1))
                         if current_iter > rew_skip_iterations: # skip first data points from reward buffer after task reset
                             rewbuffer.extend(cur_reward_sum[new_ids][:, 0].cpu().numpy().tolist()) # skip first data points
                             lenbuffer.extend(cur_episode_length[new_ids][:, 0].cpu().numpy().tolist())
@@ -403,9 +421,9 @@ class OnPolicyCoDesignRunner:
         windowed_success_ratio = sum(windowed_attempt_buffer) / len(windowed_attempt_buffer) if len(windowed_attempt_buffer) > 0 else 0.0
 
         # ---- Accumulate hardware parameters into a single JSON file ----
-        if per_iteration_hardware_parameters_path.exists():
+        if self._per_iteration_hw_parameters_path.exists():
             try:
-                with open(per_iteration_hardware_parameters_path, "r", encoding="utf-8") as f:
+                with open(self._per_iteration_hw_parameters_path, "r", encoding="utf-8") as f:
                     hw_params_history = json.load(f)
             except json.JSONDecodeError:
                 hw_params_history = {}
@@ -413,23 +431,20 @@ class OnPolicyCoDesignRunner:
             hw_params_history = {}
 
         prefix = f"hardware_iteration_{hardware_iteration}"
-        hw_params_history[f"{prefix}_z"] = float(params_dict["base_sphere_centre_z_offset"])
-        hw_params_history[f"{prefix}_cd"] = float(params_dict["concave_dimple_diameter"])
-        hw_params_history[f"{prefix}_vd"] = float(params_dict["convex_dimple_diameter"])
-        hw_params_history[f"{prefix}_cds"] = float(params_dict["concave_dimple_depth_scale"])
-        hw_params_history[f"{prefix}_vhs"] = float(params_dict["convex_dimple_height_scale"])
+        for key, val in params_dict.items():
+            hw_params_history[f"{prefix}_{key}"] = float(val)
 
-        with open(per_iteration_hardware_parameters_path, "w", encoding="utf-8") as f:
+        with open(self._per_iteration_hw_parameters_path, "w", encoding="utf-8") as f:
             json.dump(hw_params_history, f, indent=2)
         if self.log_dir is not None:
-            shutil.copy2(per_iteration_hardware_parameters_path, os.path.join(self.log_dir, "per_iteration_hardware_parameters.json"))
+            shutil.copy2(self._per_iteration_hw_parameters_path, os.path.join(self.log_dir, "per_iteration_hardware_parameters.json"))
 
         # ---- Persist reward and length buffers for the next hardware iteration ----
-        with open(rewbuffer_path, "wb") as f:
+        with open(self._rewbuffer_path, "wb") as f:
             pickle.dump(rewbuffer, f)
-        with open(lenbuffer_path, "wb") as f:
+        with open(self._lenbuffer_path, "wb") as f:
             pickle.dump(lenbuffer, f)
-        with open(windowed_attempt_buffer_path, "wb") as f:
+        with open(self._windowed_attempt_buffer_path, "wb") as f:
             pickle.dump(windowed_attempt_buffer, f)
 
         # Persist cross-iteration reward summary
@@ -439,16 +454,16 @@ class OnPolicyCoDesignRunner:
             "historical_attempt_count": float(historical_attempt_count),
             "historical_success_count": float(historical_success_count),
         }
-        with open(reward_history_path, "w", encoding="utf-8") as f:
+        with open(self._reward_history_path, "w", encoding="utf-8") as f:
             json.dump(reward_history_dict, f, indent=2)
 
         # Accumulate per-hardware-iteration reward history
         per_it_mean_rew = statistics.mean(per_it_rewbuffer)
         per_it_final_success_ratio = float(per_it_success_ratio)
 
-        if per_iteration_hardware_reward_history_path.exists():
+        if self._per_iteration_hw_reward_history_path.exists():
             try:
-                with open(per_iteration_hardware_reward_history_path, "r", encoding="utf-8") as f:
+                with open(self._per_iteration_hw_reward_history_path, "r", encoding="utf-8") as f:
                     per_it_history = json.load(f)
             except json.JSONDecodeError:
                 per_it_history = {}
@@ -461,18 +476,12 @@ class OnPolicyCoDesignRunner:
         per_it_history[f"{prefix}_success_ratio"] = float(per_it_final_success_ratio)
         per_it_history[f"{prefix}_historical_success_ratio"] = float(historical_success_ratio)
         per_it_history[f"{prefix}_windowed_success_ratio"] = float(windowed_success_ratio)
-        per_it_history[f"{prefix}_params"] = (
-            f"z={params_dict['base_sphere_centre_z_offset']:.3f} "
-            f"cd={params_dict['concave_dimple_diameter']:.3f} "
-            f"vd={params_dict['convex_dimple_diameter']:.3f} "
-            f"cds={params_dict['concave_dimple_depth_scale']:.3f} "
-            f"vhs={params_dict['convex_dimple_height_scale']:.3f}"
-        )
+        per_it_history[f"{prefix}_params"] = " ".join(f"{k}={v:.3f}" for k, v in params_dict.items())
 
-        with open(per_iteration_hardware_reward_history_path, "w", encoding="utf-8") as f:
+        with open(self._per_iteration_hw_reward_history_path, "w", encoding="utf-8") as f:
             json.dump(per_it_history, f, indent=2)
         if self.log_dir is not None:
-            shutil.copy2(per_iteration_hardware_reward_history_path, os.path.join(self.log_dir, "per_iteration_hardware_reward_history.json"))
+            shutil.copy2(self._per_iteration_hw_reward_history_path, os.path.join(self.log_dir, "per_iteration_hardware_reward_history.json"))
 
         # ---- Log hardware-iteration-level scalars to TensorBoard ----
         if self.writer is not None:

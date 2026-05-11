@@ -11,7 +11,7 @@ from tensordict import TensorDict
 from torch.distributions import Normal
 from typing import Any
 
-from rsl_rl.networks import CNN, CNN3D, MLP, EmpiricalNormalization
+from rsl_rl.networks import CNN, CNN3D, CNNTSM, MLP, EmpiricalNormalization
 
 from .actor_critic import ActorCritic
 from ipdb import set_trace
@@ -111,13 +111,34 @@ class ActorCriticCNN(ActorCritic):
             self.actor_cnns = nn.ModuleDict()
             encoding_dim = 0
             for idx, obs_group in enumerate(self.actor_obs_groups_nd):
-                cnn_class = CNN3D if self.actor_obs_ndim[obs_group] == 5 else CNN
+                cfg_dict = actor_cnn_cfg[obs_group]
+                ndim = self.actor_obs_ndim[obs_group]
+                if "frames_per_step" in cfg_dict:
+                    # CNNTSM works from both 4D (C*T,H,W) and 5D (C,T,H,W) inputs.
+                    # In both cases it needs input_dim=(H,W) and input_channels=C*T.
+                    cnn_class = CNNTSM
+                    if ndim == 5:
+                        # actor_in_dims_nd[idx] is (T,H,W); actor_in_channels_nd[idx] is C
+                        T_dim = actor_in_dims_nd[idx][0]
+                        cnn_input_dim = actor_in_dims_nd[idx][1:]
+                        cnn_input_channels = actor_in_channels_nd[idx] * T_dim
+                    else:
+                        cnn_input_dim = actor_in_dims_nd[idx]
+                        cnn_input_channels = actor_in_channels_nd[idx]
+                elif ndim == 5:
+                    cnn_class = CNN3D
+                    cnn_input_dim = actor_in_dims_nd[idx]
+                    cnn_input_channels = actor_in_channels_nd[idx]
+                else:
+                    cnn_class = CNN
+                    cnn_input_dim = actor_in_dims_nd[idx]
+                    cnn_input_channels = actor_in_channels_nd[idx]
                 self.actor_cnns[obs_group] = cnn_class(
-                    input_dim=actor_in_dims_nd[idx],
-                    input_channels=actor_in_channels_nd[idx],
-                    **actor_cnn_cfg[obs_group],
+                    input_dim=cnn_input_dim,
+                    input_channels=cnn_input_channels,
+                    **cfg_dict,
                 )
-                print(f"Actor {'CNN3D' if self.actor_obs_ndim[obs_group] == 5 else 'CNN'} for {obs_group}: {self.actor_cnns[obs_group]}")
+                print(f"Actor {cnn_class.__name__} for {obs_group}: {self.actor_cnns[obs_group]}")
                 # Get the output dimension of the CNN
                 if self.actor_cnns[obs_group].output_channels is None:
                     encoding_dim += int(self.actor_cnns[obs_group].output_dim)  # type: ignore
@@ -158,13 +179,31 @@ class ActorCriticCNN(ActorCritic):
             self.critic_cnns = nn.ModuleDict()
             encoding_dim = 0
             for idx, obs_group in enumerate(self.critic_obs_groups_nd):
-                cnn_class = CNN3D if self.critic_obs_ndim[obs_group] == 5 else CNN
+                cfg_dict = critic_cnn_cfg[obs_group]
+                ndim = self.critic_obs_ndim[obs_group]
+                if "frames_per_step" in cfg_dict:
+                    cnn_class = CNNTSM
+                    if ndim == 5:
+                        T_dim = critic_in_dims_nd[idx][0]
+                        cnn_input_dim = critic_in_dims_nd[idx][1:]
+                        cnn_input_channels = critic_in_channels_nd[idx] * T_dim
+                    else:
+                        cnn_input_dim = critic_in_dims_nd[idx]
+                        cnn_input_channels = critic_in_channels_nd[idx]
+                elif ndim == 5:
+                    cnn_class = CNN3D
+                    cnn_input_dim = critic_in_dims_nd[idx]
+                    cnn_input_channels = critic_in_channels_nd[idx]
+                else:
+                    cnn_class = CNN
+                    cnn_input_dim = critic_in_dims_nd[idx]
+                    cnn_input_channels = critic_in_channels_nd[idx]
                 self.critic_cnns[obs_group] = cnn_class(
-                    input_dim=critic_in_dims_nd[idx],
-                    input_channels=critic_in_channels_nd[idx],
-                    **critic_cnn_cfg[obs_group],
+                    input_dim=cnn_input_dim,
+                    input_channels=cnn_input_channels,
+                    **cfg_dict,
                 )
-                print(f"Critic {'CNN3D' if self.critic_obs_ndim[obs_group] == 5 else 'CNN'} for {obs_group}: {self.critic_cnns[obs_group]}")
+                print(f"Critic {cnn_class.__name__} for {obs_group}: {self.critic_cnns[obs_group]}")
                 # Get the output dimension of the CNN
                 if self.critic_cnns[obs_group].output_channels is None:
                     encoding_dim += int(self.critic_cnns[obs_group].output_dim)  # type: ignore
@@ -270,6 +309,15 @@ class ActorCriticCNN(ActorCritic):
         for obs_group in self.critic_obs_groups_nd:
             obs_dict_nd[obs_group] = obs[obs_group]
         return torch.cat(obs_list_1d, dim=-1), obs_dict_nd
+
+    def reset_cache(self, env_ids: torch.Tensor | None = None) -> None:
+        """Reset temporal caches in all CNNTSM modules for the given environments."""
+        for cnn_dict in (self.actor_cnns, self.critic_cnns):
+            if cnn_dict is None:
+                continue
+            for cnn in cnn_dict.values():
+                if hasattr(cnn, "reset_cache"):
+                    cnn.reset_cache(env_ids)
 
     def update_normalization(self, obs: TensorDict) -> None:
         if self.actor_obs_normalization:

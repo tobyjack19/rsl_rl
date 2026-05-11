@@ -115,6 +115,12 @@ class OnPolicyRunner:
                     obs, rewards, dones, extras = self.env.step(actions.to(self.env.device))
                     # Move to device
                     obs, rewards, dones = (obs.to(self.device), rewards.to(self.device), dones.to(self.device))
+                    # Reset temporal caches for environments that just finished an episode.
+                    # Note: the env auto-resets, so obs already contains the first observation
+                    # of the new episode; the cache reset takes effect from the *next* step.
+                    done_ids = (dones > 0).nonzero(as_tuple=False).squeeze(-1)
+                    if done_ids.numel() > 0 and hasattr(self.alg.policy, "reset_cache"):
+                        self.alg.policy.reset_cache(done_ids)
                     # Process the step
                     self.alg.process_env_step(obs, rewards, dones, extras)
                     # Extract intrinsic rewards (only for logging)
